@@ -1,2 +1,5 @@
 /TD
 /all_claims.json
+__pycache__/
+*.pkl
+.venv/
