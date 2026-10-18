@@ -1,6 +1,6 @@
 # Duplicate image detection
 
-`dup.py` scans images under `TD/download`, hashes each file and its pixels, skips blank pages and X-ray images, then writes an Excel workbook of pairs that appear in different folders. Claim id and attachment group come from `all_claims.json`, matched by the image path.
+`dup.py` scans images under `TD/download`, hashes each file and its pixels, skips blank pages and X-ray images, then writes an Excel workbook of duplicate pairs, suspicious folders, stats, and skips. Each image id is written once in the filename fields. Claim id and attachment group come from `all_claims.json`, matched by the image path.
 
 ## Run
 

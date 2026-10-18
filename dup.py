@@ -395,6 +395,12 @@ def hash_all_cpu(records: list[dict]) -> tuple[list, list, list]:
 
 
 # ─── تشخیص تکراری‌ها ──────────────────────────────────────
+def _image_id(rec: dict) -> str:
+    name = os.path.basename(rec.get("rel_path") or rec.get("filename") or "")
+    stem, _ext = os.path.splitext(name)
+    return stem or name
+
+
 def find_duplicate_pairs(records: list[dict]) -> pd.DataFrame:
     file_groups:  dict[str, list] = defaultdict(list)
     pixel_groups: dict[str, list] = defaultdict(list)
@@ -433,6 +439,8 @@ def find_duplicate_pairs(records: list[dict]) -> pd.DataFrame:
                 "best_dup_type":     "",
                 "_files_1":          [],
                 "_files_2":          [],
+                "_dup_ids_1":        [],
+                "_dup_ids_2":        [],
                 "_groups_1":         [],
                 "_groups_2":         [],
             }
@@ -441,6 +449,11 @@ def find_duplicate_pairs(records: list[dict]) -> pd.DataFrame:
         entry["n_shared_images"] += 1
         entry["_files_1"].append(r1["filename"])
         entry["_files_2"].append(r2["filename"])
+        id1, id2 = _image_id(r1), _image_id(r2)
+        if id1 not in entry["_dup_ids_1"]:
+            entry["_dup_ids_1"].append(id1)
+        if id2 not in entry["_dup_ids_2"]:
+            entry["_dup_ids_2"].append(id2)
         entry["_groups_1"].append(r1["attach_group"])
         entry["_groups_2"].append(r2["attach_group"])
         if DUP_PRIORITY[dup_type] > entry["best_dup_priority"]:
@@ -483,8 +496,10 @@ def find_duplicate_pairs(records: list[dict]) -> pd.DataFrame:
             "folder_id_2":     entry["folder_id_2"],
             "claimid_2":       entry["claimid_2"],
             "n_shared_images": entry["n_shared_images"],
-            "filenames_1":     " | ".join(entry["_files_1"]),
-            "filenames_2":     " | ".join(entry["_files_2"]),
+            "filenames_1":         " | ".join(dict.fromkeys(entry["_files_1"])),
+            "duplicateFilename1":  " | ".join(entry["_dup_ids_1"]),
+            "filenames_2":         " | ".join(dict.fromkeys(entry["_files_2"])),
+            "duplicateFilename2":  " | ".join(entry["_dup_ids_2"]),
             "attach_groups_1": " | ".join(dict.fromkeys(entry["_groups_1"])),
             "attach_groups_2": " | ".join(dict.fromkeys(entry["_groups_2"])),
         })
@@ -541,8 +556,8 @@ def build_folder_summary(df: pd.DataFrame) -> pd.DataFrame:
 # ─── ذخیره Excel ──────────────────────────────────────────
 PAIR_COLS = [
     "risk_level", "risk_reason", "dup_type",
-    "folder_id_1", "claimid_1", "attach_groups_1", "filenames_1",
-    "folder_id_2", "claimid_2", "attach_groups_2", "filenames_2",
+    "folder_id_1", "claimid_1", "attach_groups_1", "filenames_1", "duplicateFilename1",
+    "folder_id_2", "claimid_2", "attach_groups_2", "filenames_2", "duplicateFilename2",
     "n_shared_images",
 ]
 
