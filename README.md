@@ -19,7 +19,7 @@ Paths are set at the top of `dup.py`:
 |---|---|
 | `BASE_DIR` | Project folder. Images are read from `TD/download` inside it |
 | `JSON_PATH` | Claims JSON used to look up claim id and attachment group for each scanned file |
-| `EXCEL_DIR` | Folder `excel output`. Each run writes `exact_duplicate_pairs_YYYYMMDD_HHMMSS.xlsx` |
+| `EXCEL_DIR` | Folder `excel+output`. Each run writes `exact_duplicate_pairs_YYYYMMDD_HHMMSS.xlsx` |
 | `CACHE_FILE` | Pickle cache so a rerun can skip hashing |
 
 GPU hashing is used when CUDA is available. Otherwise the script hashes on CPU.

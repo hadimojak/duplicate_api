@@ -7,5 +7,6 @@ __pycache__/
 /excel output/
 /temp_images/
 .venv/
-/hash_cache_all.pkl
-/hash_cache_new.pkl
+
+hash_cache_all.pkl
+/excel_output/**/*.xlsx

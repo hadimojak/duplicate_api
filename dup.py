@@ -30,7 +30,7 @@ except ImportError:
 BASE_DIR     = r"C:\Users\day\Documents\duplicate_fraud_api"
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "TD", "download")
 JSON_PATH    = r"C:\Users\day\Documents\duplicate_fraud_api\all_claims.json"
-EXCEL_DIR    = os.path.join(BASE_DIR, "excel output")
+EXCEL_DIR    = os.path.join(BASE_DIR, "excel_output")
 CACHE_FILE   = r"C:\Users\day\Documents\duplicate_fraud_api\hash_cache_all.pkl"
 IMAGE_EXTS   = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 MAX_WORKERS = 8
