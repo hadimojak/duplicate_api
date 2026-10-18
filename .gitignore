@@ -1,5 +1,11 @@
 /TD
 /all_claims.json
+/all_claims_new.json
+/job_state.json
 __pycache__/
 *.pkl
+/excel output/
+/temp_images/
 .venv/
+/hash_cache_all.pkl
+/hash_cache_new.pkl

@@ -30,7 +30,7 @@ except ImportError:
 BASE_DIR     = r"C:\Users\day\Documents\duplicate_fraud_api"
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "TD", "download")
 JSON_PATH    = r"C:\Users\day\Documents\duplicate_fraud_api\all_claims.json"
-OUT_EXCEL    = r"C:\Users\day\Documents\duplicate_fraud_api\exact_all_duplicate_pairs.xlsx"
+EXCEL_DIR    = os.path.join(BASE_DIR, "excel output")
 CACHE_FILE   = r"C:\Users\day\Documents\duplicate_fraud_api\hash_cache_all.pkl"
 IMAGE_EXTS   = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 MAX_WORKERS = 8
@@ -74,29 +74,72 @@ class ImageRecord:
 
 
 # ─── Cache ────────────────────────────────────────────────
-def load_cache(cache_path: str, fingerprint: str) -> dict | None:
+def load_cache(cache_path: str, fingerprint: str | None = None) -> dict | None:
     if not os.path.exists(cache_path):
         return None
     try:
         with open(cache_path, "rb") as f:
             cache = pickle.load(f)
-        checks = [
-            cache.get("json_fingerprint")  == fingerprint,
-            cache.get("blank_var_thresh")  == BLANK_VAR_THRESH,
-            cache.get("blank_ent_thresh")  == BLANK_ENTROPY_THRESH,
-            cache.get("xray_max_mean")     == XRAY_MAX_MEAN,
-            cache.get("xray_min_std")      == XRAY_MIN_STD,
-            cache.get("xray_max_color")    == XRAY_MAX_COLOR_DIFF,
-            cache.get("cache_version")     == _CACHE_VERSION,
-        ]
-        if not all(checks):
-            log.info("Cache بی‌اعتبار → هش‌گذاری مجدد")
+        if not isinstance(cache, dict) or not isinstance(cache.get("ok"), list):
+            log.warning("Cache file has no hashed records")
             return None
-        log.info(f"Cache معتبر — {len(cache['ok']):,} رکورد")
+        log.info(
+            f"Loaded cache — {len(cache['ok']):,} hashed, "
+            f"{len(cache.get('err') or []):,} errors, "
+            f"{len(cache.get('skipped') or []):,} skipped"
+        )
+        if fingerprint is not None and cache.get("json_fingerprint") != fingerprint:
+            log.info("Cache file list changed; new images will be added")
         return cache
     except Exception as e:
-        log.warning(f"Cache خوانده نشد: {e}")
+        log.warning(f"Could not read cache: {e}")
         return None
+
+
+def _cache_filename(rec: dict) -> str:
+    raw = rec.get("rel_path") or rec.get("filename") or ""
+    return os.path.basename(str(raw).replace("\\", "/"))
+
+
+def append_new_images(
+    records: list[dict],
+    ok: list[dict],
+    err: list[dict],
+    skipped: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    known = {
+        name
+        for bucket in (ok, err, skipped)
+        for rec in bucket
+        if (name := _cache_filename(rec))
+    }
+    already = len(known)
+    new_records = []
+    for rec in records:
+        name = _cache_filename(rec)
+        if not name or name in known:
+            continue
+        known.add(name)
+        new_records.append(rec)
+    log.info(f"New images to hash: {len(new_records):,} (already cached filenames: {already:,})")
+    if not new_records:
+        return ok, err, skipped
+
+    gpu_ok = _TORCH_OK and torch.cuda.is_available()
+    if gpu_ok:
+        log.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        new_ok, new_err, new_skipped = hash_all_gpu(new_records, torch.device("cuda"))
+    else:
+        log.info(f"CPU: {MAX_WORKERS} workers")
+        new_ok, new_err, new_skipped = hash_all_cpu(new_records)
+
+    ok.extend(new_ok)
+    err.extend(new_err)
+    skipped.extend(new_skipped)
+    stored = ok + err + skipped
+    save_cache(CACHE_FILE, _fingerprint_dicts(stored), ok, err, skipped)
+    log.info(f"Added {len(new_records):,} images to {CACHE_FILE}")
+    return ok, err, skipped
 
 
 def save_cache(cache_path: str, fingerprint: str,
@@ -115,7 +158,7 @@ def save_cache(cache_path: str, fingerprint: str,
             "err":              err,
             "skipped":          skipped,
         }, f, protocol=pickle.HIGHEST_PROTOCOL)
-    log.info(f"Cache ذخیره → {cache_path}")
+    log.info(f"Cache saved → {cache_path}")
 
 
 # ─── بارگذاری JSON ────────────────────────────────────────
@@ -132,7 +175,7 @@ def _norm_rel(path: str) -> str:
 
 def scan_download_images(download_dir: str) -> list[ImageRecord]:
     if not os.path.isdir(download_dir):
-        log.error(f"پوشه تصاویر پیدا نشد: {download_dir}")
+        log.error(f"Image folder not found: {download_dir}")
         return []
 
     records = []
@@ -156,7 +199,7 @@ def scan_download_images(download_dir: str) -> list[ImageRecord]:
                 file_size    = size,
             ))
     records.sort(key=lambda r: r.rel_path)
-    log.info(f"TD/download: {len(records):,} تصویر")
+    log.info(f"TD/download: {len(records):,} images")
     return records
 
 
@@ -189,7 +232,7 @@ def load_claim_index(json_path: str) -> dict[str, dict]:
                     "attach_group": str(group),
                     "name": display_name,
                 }
-    log.info(f"JSON: {len(index):,} مسیر")
+    log.info(f"JSON: {len(index):,} paths")
     return index
 
 
@@ -205,15 +248,6 @@ def attach_claim_details(records: list[dict], index: dict[str, dict]) -> int:
             rec["filename"] = info["name"]
         matched += 1
     return matched
-
-
-def _files_fingerprint(records: list[ImageRecord]) -> str:
-    h = hashlib.sha256()
-    for rec in records:
-        h.update(rec.rel_path.encode())
-        h.update(str(rec.file_size).encode())
-        h.update(b"\n")
-    return h.hexdigest()
 
 
 # ─── تشخیص برگه سفید ──────────────────────────────────────
@@ -479,13 +513,13 @@ def find_duplicate_pairs(records: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
     RISK_MAP = {
-        2: ("VERY_HIGH", "فایل خام یکسان بین پرونده‌های مختلف"),
-        1: ("HIGH",      "محتوای پیکسلی یکسان — فرمت متفاوت"),
+        2: ("VERY_HIGH", "Identical file bytes across different folders"),
+        1: ("HIGH",      "Identical pixel content with a different format"),
     }
     rows = []
     for entry in folder_pairs.values():
         risk_level, risk_reason = RISK_MAP.get(
-            entry["best_dup_priority"], ("MEDIUM", "شباهت محتوا")
+            entry["best_dup_priority"], ("MEDIUM", "Similar content")
         )
         rows.append({
             "risk_level":      risk_level,
@@ -562,7 +596,13 @@ PAIR_COLS = [
 ]
 
 
-def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path):
+def excel_output_path() -> str:
+    os.makedirs(EXCEL_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(EXCEL_DIR, f"exact_duplicate_pairs_{stamp}.xlsx")
+
+
+def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path) -> str:
     def _write(p):
         with pd.ExcelWriter(p, engine="openpyxl") as w:
             df_pairs[PAIR_COLS].to_excel(
@@ -597,95 +637,149 @@ def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path):
     except PermissionError:
         alt = f"{os.path.splitext(path)[0]}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         _write(alt)
-        log.warning(f"فایل قفل بود → {alt}")
+        log.warning(f"File was locked → {alt}")
         path = alt
-    log.info(f"Excel ذخیره → {path}")
+    log.info(f"Excel saved → {path}")
+    return path
+
+
+def records_from_claims(claims: list[dict], image_root: str | None = None) -> list[ImageRecord]:
+    root = image_root or BASE_DIR
+    records = []
+    seen: set[str] = set()
+    for entry in claims:
+        attachments_data = entry.get("attachments")
+        if not isinstance(attachments_data, dict):
+            continue
+        for group, files in attachments_data.items():
+            if not isinstance(files, list):
+                continue
+            for item in files:
+                if isinstance(item, dict):
+                    rel = item.get("path", "")
+                    size = int(item.get("size") or 0)
+                    display_name = item.get("name") or ""
+                elif isinstance(item, str):
+                    rel, size, display_name = item, 0, ""
+                else:
+                    continue
+                rel = _norm_rel(rel)
+                if not rel or rel in seen:
+                    continue
+                seen.add(rel)
+                records.append(ImageRecord(
+                    folder_id    = extract_folder_id(rel),
+                    claimid      = str(entry.get("claimid", "")),
+                    attach_group = str(group),
+                    filename     = display_name or os.path.basename(rel),
+                    rel_path     = rel,
+                    full_path    = os.path.join(root, rel.replace("/", os.sep)),
+                    file_size    = size,
+                ))
+    records.sort(key=lambda r: r.rel_path)
+    return records
+
+
+def publish_results(ok: list[dict], err: list[dict], skipped: list[dict], json_path: str) -> None:
+    claim_index = load_claim_index(json_path)
+    matched = attach_claim_details(ok, claim_index)
+    matched += attach_claim_details(err, claim_index)
+    matched += attach_claim_details(skipped, claim_index)
+    log.info(f"JSON details found for {matched:,} images")
+
+    n_blank = sum(1 for r in skipped if "blank_image" in str(r.get("skipped", "")))
+    n_xray  = sum(1 for r in skipped if "xray_image" in str(r.get("skipped", "")))
+    log.info(
+        f"OK: {len(ok):,} | Errors: {len(err):,} | "
+        f"Skipped: {len(skipped):,} (blank={n_blank:,}, xray={n_xray:,})"
+    )
+
+    log.info("Looking for duplicates...")
+    df_pairs = find_duplicate_pairs(ok)
+    if df_pairs.empty:
+        log.info("No duplicate images found across folders.")
+        return
+
+    df_summary = build_folder_summary(df_pairs)
+    vh = (df_pairs["risk_level"] == "VERY_HIGH").sum()
+    hi = (df_pairs["risk_level"] == "HIGH").sum()
+    folders = pd.concat([df_pairs["folder_id_1"], df_pairs["folder_id_2"]]).nunique()
+    df_stats = pd.DataFrame([
+        {"metric": "Images processed",                    "value": len(ok)},
+        {"metric": "Filtered — blank page",               "value": n_blank},
+        {"metric": "Filtered — X-ray",                    "value": n_xray},
+        {"metric": "Errors / missing files",              "value": len(err)},
+        {"metric": "Duplicate folder pairs",              "value": len(df_pairs)},
+        {"metric": "VERY_HIGH — exact_file",              "value": int(vh)},
+        {"metric": "HIGH — exact_pixel",                  "value": int(hi)},
+        {"metric": "Folders involved",                    "value": int(folders)},
+    ])
+    saved = save_excel(df_pairs, df_summary, df_stats, err, skipped, excel_output_path())
+
+    print("\n" + "=" * 60)
+    print("  Duplicate image results")
+    print("=" * 60)
+    print(f"  Processed:                                 {len(ok):>8,}")
+    print(f"  Filtered — blank page:                     {n_blank:>8,}")
+    print(f"  Filtered — X-ray:                          {n_xray:>8,}")
+    print(f"  Errors:                                    {len(err):>8,}")
+    print(f"  -------------------------------------------------")
+    print(f"  Duplicate folder pairs:                    {len(df_pairs):>8,}")
+    print(f"  VERY_HIGH (exact_file):                    {vh:>8,}")
+    print(f"  HIGH      (exact_pixel):                   {hi:>8,}")
+    print(f"  Folders involved:                          {folders:>8,}")
+    print(f"\n  Excel → {saved}")
+    print("=" * 60)
+
+    if not df_summary.empty:
+        print("\n  Top 10 highest-risk folders:")
+        print(f"  {'folder_id':<18} {'risk':<12} {'shared images':>14}  {'folders':>8}")
+        print("  " + "─" * 56)
+        for _, r in df_summary.head(10).iterrows():
+            print(
+                f"  {r['folder_id']:<18} {r['risk_level']:<12} "
+                f"{r['total_shared_images']:>10}  {r['n_shared_with_folders']:>11}"
+            )
+
+
+def detect_from_json(json_path: str, image_root: str | None = None) -> None:
+    with open(json_path, "r", encoding="utf-8") as f:
+        claims = json.load(f)
+    records = records_from_claims(claims, image_root)
+    if not records:
+        log.info("No images in the JSON to process.")
+        return
+
+    cache = load_cache(CACHE_FILE)
+    ok = list(cache["ok"]) if cache else []
+    err = list(cache["err"]) if cache else []
+    skipped = list(cache["skipped"]) if cache else []
+    ok, err, skipped = append_new_images([asdict(rec) for rec in records], ok, err, skipped)
+    publish_results(ok, err, skipped, json_path)
+
+
+def _fingerprint_dicts(records: list[dict]) -> str:
+    h = hashlib.sha256()
+    for rec in sorted(records, key=lambda item: item.get("rel_path", "")):
+        h.update(str(rec.get("rel_path", "")).encode())
+        h.update(str(rec.get("file_size", 0)).encode())
+        h.update(b"\n")
+    return h.hexdigest()
 
 
 # ─── main ──────────────────────────────────────────────────
 def main():
     records = scan_download_images(DOWNLOAD_DIR)
     if not records:
-        log.error("تصویری در TD/download برای پردازش نیست.")
+        log.error("No images in TD/download to process.")
         return
     records_dicts = [asdict(r) for r in records]
-
-    fingerprint = _files_fingerprint(records)
-    cache       = load_cache(CACHE_FILE, fingerprint)
-
-    if cache:
-        ok, err, skipped = cache["ok"], cache["err"], cache["skipped"]
-    else:
-        gpu_ok = _TORCH_OK and torch.cuda.is_available()
-        if gpu_ok:
-            log.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            ok, err, skipped = hash_all_gpu(records_dicts, torch.device("cuda"))
-        else:
-            log.info(f"CPU: {MAX_WORKERS} workers")
-            ok, err, skipped = hash_all_cpu(records_dicts)
-        save_cache(CACHE_FILE, fingerprint, ok, err, skipped)
-
-    claim_index = load_claim_index(JSON_PATH)
-    matched = attach_claim_details(ok, claim_index)
-    matched += attach_claim_details(err, claim_index)
-    matched += attach_claim_details(skipped, claim_index)
-    log.info(f"جزئیات JSON برای {matched:,} تصویر از {len(records):,} پیدا شد")
-
-    n_blank = sum(1 for r in skipped if "blank_image" in str(r.get("skipped","")))
-    n_xray  = sum(1 for r in skipped if "xray_image"  in str(r.get("skipped","")))
-    log.info(f"OK: {len(ok):,} | Errors: {len(err):,} | "
-             f"Skipped: {len(skipped):,} (blank={n_blank:,}, xray={n_xray:,})")
-
-    log.info("تشخیص تکراری‌ها...")
-    df_pairs = find_duplicate_pairs(ok)
-
-    if df_pairs.empty:
-        log.info("هیچ تصویر تکراری بین پرونده‌ای پیدا نشد.")
-        return
-
-    df_summary = build_folder_summary(df_pairs)
-
-    vh      = (df_pairs["risk_level"] == "VERY_HIGH").sum()
-    hi      = (df_pairs["risk_level"] == "HIGH").sum()
-    folders = pd.concat(
-        [df_pairs["folder_id_1"], df_pairs["folder_id_2"]]
-    ).nunique()
-
-    df_stats = pd.DataFrame([
-        {"metric": "کل تصاویر پردازش‌شده",               "value": len(ok)},
-        {"metric": "فیلترشده — برگه سفید",                "value": n_blank},
-        {"metric": "فیلترشده — رادیولوژی/اشعه ایکس",     "value": n_xray},
-        {"metric": "خطا / فایل گم‌شده",                  "value": len(err)},
-        {"metric": "جفت پرونده‌های تکراری (بدون تکرار)", "value": len(df_pairs)},
-        {"metric": "VERY_HIGH — exact_file",               "value": int(vh)},
-        {"metric": "HIGH — exact_pixel",                   "value": int(hi)},
-        {"metric": "پرونده‌های منحصربه‌فرد درگیر",        "value": int(folders)},
-    ])
-
-    save_excel(df_pairs, df_summary, df_stats, err, skipped, OUT_EXCEL)
-
-    print("\n" + "═" * 60)
-    print("  نتایج تشخیص تصاویر تکراری")
-    print("═" * 60)
-    print(f"  کل پردازش‌شده:                            {len(ok):>8,}")
-    print(f"  فیلتر — برگه سفید:                        {n_blank:>8,}")
-    print(f"  فیلتر — رادیولوژی:                        {n_xray:>8,}")
-    print(f"  خطا:                                       {len(err):>8,}")
-    print(f"  ─────────────────────────────────────────────────")
-    print(f"  جفت پرونده تکراری (هر جفت یک ردیف):      {len(df_pairs):>8,}")
-    print(f"  VERY_HIGH (exact_file):                    {vh:>8,}")
-    print(f"  HIGH      (exact_pixel):                   {hi:>8,}")
-    print(f"  پرونده‌های درگیر:                          {folders:>8,}")
-    print(f"\n  اکسل → {OUT_EXCEL}")
-    print("═" * 60)
-
-    if not df_summary.empty:
-        print("\n  ۱۰ پرونده پرریسک‌ترین:")
-        print(f"  {'folder_id':<18} {'risk':<12} {'عکس مشترک':>10}  {'با N پرونده':>11}")
-        print("  " + "─" * 56)
-        for _, r in df_summary.head(10).iterrows():
-            print(f"  {r['folder_id']:<18} {r['risk_level']:<12} "
-                  f"{r['total_shared_images']:>10}  {r['n_shared_with_folders']:>11}")
+    cache = load_cache(CACHE_FILE)
+    ok = list(cache["ok"]) if cache else []
+    err = list(cache["err"]) if cache else []
+    skipped = list(cache["skipped"]) if cache else []
+    ok, err, skipped = append_new_images(records_dicts, ok, err, skipped)
+    publish_results(ok, err, skipped, JSON_PATH)
 
 
 if __name__ == "__main__":
