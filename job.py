@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import threading
+import time
 
 import psycopg
 from minio import Minio
@@ -17,13 +18,15 @@ JSON_PATH = os.path.join(BASE_DIR, "all_claims_new.json")
 STATE_PATH = os.path.join(BASE_DIR, "job_state.json")
 TEMP_DIR = os.path.join(BASE_DIR, "temp_images")
 INTERVAL_SECONDS = 5 * 60
+CHUNK_SIZE = 50
 
 PG = dict(
-    host="127.0.0.1",
-    port=5432,
-    dbname="duplicate_fraud",
-    user="postgres",
-    password="postgres",
+    host="192.168.20.41",
+    port=6002,
+    dbname="postgres",
+    user="td_user",
+    password="td_user_pass",
+    options="-c search_path=public",
 )
 
 MINIO = Minio(
@@ -64,7 +67,7 @@ def save_last_id(last_id: int) -> None:
     log.info("Saved last id: %s", last_id)
 
 
-def fetch_new_rows(last_id: int) -> list[dict]:
+def fetch_new_rows(last_id: int, limit: int = CHUNK_SIZE) -> list[dict]:
     with psycopg.connect(**PG, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -73,8 +76,9 @@ def fetch_new_rows(last_id: int) -> list[dict]:
                 FROM "TreatmentDamages"
                 WHERE "Id" > %s
                 ORDER BY "Id"
+                LIMIT %s
                 """,
-                (last_id,),
+                (last_id, limit),
             )
             return list(cur.fetchall())
 
@@ -156,15 +160,7 @@ def write_new_claims(new_claims: list[dict]) -> None:
     log.info("all_claims_new.json written from %s new TreatmentDamages rows", len(new_claims))
 
 
-def run_once() -> None:
-    last_id = load_last_id()
-    rows = fetch_new_rows(last_id)
-    if not rows:
-        log.info("No new rows after id %s", last_id)
-        return
-
-    claims = [row_to_claim(row) for row in rows]
-    log.info("Read %s rows, from id %s to %s", len(rows), rows[0]["Id"], rows[-1]["Id"])
+def log_documents(claims: list[dict]) -> None:
     for claim in claims:
         docs = [
             item.get("path", "")
@@ -185,6 +181,18 @@ def run_once() -> None:
                 claim["treatmentDamageId"],
                 claim["claimid"],
             )
+
+
+def process_chunk(rows: list[dict], chunk_no: int) -> None:
+    claims = [row_to_claim(row) for row in rows]
+    log.info(
+        "Chunk %s: %s rows, from id %s to %s",
+        chunk_no,
+        len(rows),
+        rows[0]["Id"],
+        rows[-1]["Id"],
+    )
+    log_documents(claims)
     saved_paths: list[str] = []
     try:
         write_new_claims(claims)
@@ -195,19 +203,67 @@ def run_once() -> None:
         remove_temp_images(saved_paths)
 
 
+def run_once() -> None:
+    last_id = load_last_id()
+    chunk_no = 0
+    total_rows = 0
+
+    while not stop.is_set():
+        rows = fetch_new_rows(last_id, CHUNK_SIZE)
+        if not rows:
+            if total_rows == 0:
+                log.info("No new rows after id %s", last_id)
+            else:
+                log.info(
+                    "All new rows processed in %s chunk(s), %s rows total",
+                    chunk_no,
+                    total_rows,
+                )
+            return
+
+        chunk_no += 1
+        process_chunk(rows, chunk_no)
+        total_rows += len(rows)
+        last_id = int(rows[-1]["Id"])
+        if len(rows) < CHUNK_SIZE:
+            log.info(
+                "All new rows processed in %s chunk(s), %s rows total",
+                chunk_no,
+                total_rows,
+            )
+            return
+
+    log.info(
+        "Shutdown during chunking after %s chunk(s), %s rows; remaining rows stay for the next run",
+        chunk_no,
+        total_rows,
+    )
+
+
 def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, request_stop)
 
-    log.info("Job started; running every %s seconds", INTERVAL_SECONDS)
+    log.info(
+        "Job started; interval is %s seconds (paused while a round runs); new rows in chunks of %s",
+        INTERVAL_SECONDS,
+        CHUNK_SIZE,
+    )
     while not stop.is_set():
+        started = time.monotonic()
+        log.info("Round started")
         try:
             run_once()
         except Exception:
             log.exception("This round failed; the last id was not advanced")
-        if stop.is_set() or stop.wait(INTERVAL_SECONDS):
+        elapsed = time.monotonic() - started
+        log.info("Round finished in %.1f seconds", elapsed)
+        if stop.is_set():
+            break
+        log.info("Interval paused during work; waiting %s seconds until the next round", INTERVAL_SECONDS)
+        if stop.wait(INTERVAL_SECONDS):
             break
     log.info("Job stopped")
 

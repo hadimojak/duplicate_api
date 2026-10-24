@@ -32,4 +32,4 @@ GPU hashing is used when CUDA is available. Otherwise the script hashes on CPU.
 .\.venv\Scripts\python.exe job.py
 ```
 
-Leave that process running. Postgres is `127.0.0.1:5432`, database `duplicate_fraud`, user `postgres`, password `postgres`.
+Leave that process running. Postgres is `192.168.20.41:6002`, database `postgres`, schema `public`, user `td_user`, password `td_user_pass`. Table: `TreatmentDamages`.
