@@ -1,6 +1,6 @@
 # Duplicate image detection
 
-`dup.py` scans images under `TD/download`, hashes each file and its pixels, skips blank pages and X-ray images, then writes an Excel workbook of duplicate pairs, suspicious folders, stats, and skips. Each image id is written once in the filename fields. Claim id and attachment group come from `all_claims.json`, matched by the image path.
+`dup.py` can still scan local images under `TD/download` for offline runs. The scheduled job path does not use claim JSON files or local image files.
 
 ## Run
 
@@ -13,23 +13,21 @@ pip install -r requirements.txt
 python dup.py
 ```
 
-Paths are set at the top of `dup.py`:
-
-| Setting | Role |
-|---|---|
-| `BASE_DIR` | Project folder. Images are read from `TD/download` inside it |
-| `JSON_PATH` | Claims JSON used to look up claim id and attachment group for each scanned file |
-| `EXCEL_DIR` | Folder `excel+output`. Each run writes `exact_duplicate_pairs_YYYYMMDD_HHMMSS.xlsx` |
-| `CACHE_FILE` | Pickle cache so a rerun can skip hashing |
-
-GPU hashing is used when CUDA is available. Otherwise the script hashes on CPU.
-
 ## Scheduled job
 
-`job.py` checks Postgres every 5 minutes. It reads `TreatmentDamages` rows whose `Id` is greater than the last saved id, writes only those rows to `all_claims_new.json`, downloads their images from MinIO into `temp_images/TD/download`, runs duplicate detection, then deletes those temporary images. The checkpoint is `job_state.json`. A row is marked done only after that round finishes, so a failed round is tried again.
+`job.py` checks Postgres every 5 minutes. It loads `TreatmentDamages` with `State = 10` and `Id > 1447005` that are not in `checked_ids`, builds claims in memory, downloads their images from MinIO into `temp_images/`, runs duplicate detection, then deletes those temp files and saves the ids in `job_state.json`. `min_id` stays fixed at `1447005`.
+
+MinIO settings (env, with defaults):
+
+```
+MINIO_ENDPOINT=192.168.20.22
+MINIO_PORT=9000
+MINIO_USE_SSL=false
+MINIO_ACCESS_KEY=KKgWercFhZjtoIDnULTz
+MINIO_SECRET_KEY=Flrr462el7E5cQFwo81HeA6x55zslRJnzboq7k2x
+MINIO_BUCKET=policy-management
+```
 
 ```powershell
 .\.venv\Scripts\python.exe job.py
 ```
-
-Leave that process running. Postgres is `192.168.20.41:6002`, database `postgres`, schema `public`, user `td_user`, password `td_user_pass`. Table: `TreatmentDamages`.

@@ -10,6 +10,8 @@ from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
+from io import BytesIO
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -27,11 +29,11 @@ except ImportError:
     _TORCH_OK = False
  
 # ─── تنظیمات ──────────────────────────────────────────────
-BASE_DIR     = r"C:\Users\day\Documents\duplicate_fraud_api"
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "TD", "download")
-JSON_PATH    = r"C:\Users\day\Documents\duplicate_fraud_api\all_claims.json"
+JSON_PATH    = os.path.join(BASE_DIR, "all_claims.json")
 EXCEL_DIR    = os.path.join(BASE_DIR, "excel_output")
-CACHE_FILE   = r"C:\Users\day\Documents\duplicate_fraud_api\hash_cache_all.pkl"
+CACHE_FILE   = os.path.join(BASE_DIR, "hash_cache_all.pkl")
 IMAGE_EXTS   = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 MAX_WORKERS = 8
 CHUNK_SIZE  = 1 << 20
@@ -203,12 +205,9 @@ def scan_download_images(download_dir: str) -> list[ImageRecord]:
     return records
 
 
-def load_claim_index(json_path: str) -> dict[str, dict]:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
+def claim_index_from_claims(claims: list[dict]) -> dict[str, dict]:
     index: dict[str, dict] = {}
-    for entry in data:
+    for entry in claims:
         claimid = str(entry.get("claimid", ""))
         attachments_data = entry.get("attachments")
         if not isinstance(attachments_data, dict):
@@ -232,8 +231,14 @@ def load_claim_index(json_path: str) -> dict[str, dict]:
                     "attach_group": str(group),
                     "name": display_name,
                 }
-    log.info(f"JSON: {len(index):,} paths")
+    log.info(f"Claims index: {len(index):,} paths")
     return index
+
+
+def load_claim_index(json_path: str) -> dict[str, dict]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return claim_index_from_claims(data)
 
 
 def attach_claim_details(records: list[dict], index: dict[str, dict]) -> int:
@@ -258,16 +263,12 @@ def _image_entropy(arr: np.ndarray) -> float:
     return float(-np.sum(hist * np.log2(hist)))
 
 
-def is_blank_image(path: str, file_size: int) -> str:
-    real_size = file_size if file_size > 0 else 0
-    try:
-        real_size = real_size or os.path.getsize(path)
-    except OSError:
-        return ""
+def is_blank_image_bytes(data: bytes, file_size: int) -> str:
+    real_size = file_size if file_size > 0 else len(data)
     if real_size > MAX_FILE_BYTES_FOR_BLANK_CHECK:
         return ""
     try:
-        with Image.open(path) as img:
+        with Image.open(BytesIO(data)) as img:
             gray = ImageOps.exif_transpose(img).convert("L")
             gray.thumbnail((64, 64), Image.LANCZOS)
             arr = np.array(gray, dtype=np.float32)
@@ -280,10 +281,25 @@ def is_blank_image(path: str, file_size: int) -> str:
     return ""
 
 
-# ─── تشخیص رادیولوژی ──────────────────────────────────────
-def is_xray_image(path: str) -> str:
+def is_blank_image(path: str, file_size: int) -> str:
+    real_size = file_size if file_size > 0 else 0
     try:
-        with Image.open(path) as img:
+        real_size = real_size or os.path.getsize(path)
+    except OSError:
+        return ""
+    if real_size > MAX_FILE_BYTES_FOR_BLANK_CHECK:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            return is_blank_image_bytes(f.read(), real_size)
+    except OSError:
+        return ""
+
+
+# ─── تشخیص رادیولوژی ──────────────────────────────────────
+def is_xray_image_bytes(data: bytes) -> str:
+    try:
+        with Image.open(BytesIO(data)) as img:
             img = ImageOps.exif_transpose(img).convert("RGB")
             img.thumbnail((128, 128), Image.LANCZOS)
             arr = np.array(img, dtype=np.float32)
@@ -308,7 +324,19 @@ def is_xray_image(path: str) -> str:
     return ""
 
 
+def is_xray_image(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return is_xray_image_bytes(f.read())
+    except OSError:
+        return ""
+
+
 # ─── توابع هش ─────────────────────────────────────────────
+def _file_sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def _file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -317,8 +345,8 @@ def _file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def _pixel_sha256_cpu(path: str) -> tuple[str, str]:
-    with Image.open(path) as img:
+def _pixel_sha256_bytes(data: bytes) -> tuple[str, str]:
+    with Image.open(BytesIO(data)) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
         w, h = img.size
         thumb = img.copy()
@@ -327,6 +355,11 @@ def _pixel_sha256_cpu(path: str) -> tuple[str, str]:
             thumb.tobytes() + f"{w}x{h}".encode()
         ).hexdigest()
     return digest, f"{w}x{h}"
+
+
+def _pixel_sha256_cpu(path: str) -> tuple[str, str]:
+    with open(path, "rb") as f:
+        return _pixel_sha256_bytes(f.read())
 
 
 def _pixel_sha256_gpu(path: str, device) -> tuple[str, str]:
@@ -594,6 +627,7 @@ PAIR_COLS = [
     "folder_id_2", "claimid_2", "attach_groups_2", "filenames_2", "duplicateFilename2",
     "n_shared_images",
 ]
+MAX_EXCEL_BYTES = 5 * 1024 * 1024  # 5 MB per Excel file
 
 
 def excel_output_path() -> str:
@@ -602,35 +636,53 @@ def excel_output_path() -> str:
     return os.path.join(EXCEL_DIR, f"exact_duplicate_pairs_{stamp}.xlsx")
 
 
-def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path) -> str:
-    def _write(p):
-        with pd.ExcelWriter(p, engine="openpyxl") as w:
-            df_pairs[PAIR_COLS].to_excel(
-                w, sheet_name="duplicate_pairs",    index=False)
-            df_summary.to_excel(
-                w, sheet_name="suspicious_folders", index=False)
-            df_pairs[df_pairs["risk_level"] == "VERY_HIGH"][PAIR_COLS].to_excel(
-                w, sheet_name="VERY_HIGH_only",     index=False)
-            df_stats.to_excel(
-                w, sheet_name="statistics",         index=False)
-            if errors:
-                pd.DataFrame(errors).to_excel(
-                    w, sheet_name="errors",         index=False)
-            if skipped:
-                df_skip = pd.DataFrame(skipped)[[
-                    "folder_id", "claimid", "filename",
-                    "rel_path", "file_size", "skipped"
-                ]].copy()
-                df_skip["skip_type"] = df_skip["skipped"].apply(
-                    lambda s: "xray" if "xray_image" in str(s) else "blank"
-                )
-                df_skip.to_excel(
-                    w, sheet_name="skipped_images", index=False)
+def _skipped_frame(skipped: list[dict]) -> pd.DataFrame:
+    if not skipped:
+        return pd.DataFrame()
+    df_skip = pd.DataFrame(skipped)[[
+        "folder_id", "claimid", "filename",
+        "rel_path", "file_size", "skipped"
+    ]].copy()
+    df_skip["skip_type"] = df_skip["skipped"].apply(
+        lambda s: "xray" if "xray_image" in str(s) else "blank"
+    )
+    return df_skip
 
+
+def _write_excel_part(
+    path: str,
+    df_pairs: pd.DataFrame,
+    df_summary: pd.DataFrame,
+    df_stats: pd.DataFrame,
+    errors: list[dict] | None,
+    df_skip: pd.DataFrame | None,
+    part_no: int,
+    part_total: int,
+) -> str:
+    stats = df_stats.copy()
+    if part_total > 1:
+        stats = pd.concat([
+            stats,
+            pd.DataFrame([
+                {"metric": "Excel part", "value": f"{part_no}/{part_total}"},
+            ]),
+        ], ignore_index=True)
+
+    def _write(p: str) -> None:
+        with pd.ExcelWriter(p, engine="openpyxl") as w:
+            pairs = df_pairs[PAIR_COLS] if not df_pairs.empty else pd.DataFrame(columns=PAIR_COLS)
+            pairs.to_excel(w, sheet_name="duplicate_pairs", index=False)
+            df_summary.to_excel(w, sheet_name="suspicious_folders", index=False)
+            very_high = pairs[pairs["risk_level"] == "VERY_HIGH"] if not pairs.empty else pairs
+            very_high.to_excel(w, sheet_name="VERY_HIGH_only", index=False)
+            stats.to_excel(w, sheet_name="statistics", index=False)
+            if errors:
+                pd.DataFrame(errors).to_excel(w, sheet_name="errors", index=False)
+            if df_skip is not None and not df_skip.empty:
+                df_skip.to_excel(w, sheet_name="skipped_images", index=False)
                 df_xray = df_skip[df_skip["skip_type"] == "xray"]
                 if not df_xray.empty:
-                    df_xray.to_excel(
-                        w, sheet_name="skipped_xray", index=False)
+                    df_xray.to_excel(w, sheet_name="skipped_xray", index=False)
 
     try:
         _write(path)
@@ -639,8 +691,123 @@ def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path) -> str:
         _write(alt)
         log.warning(f"File was locked → {alt}")
         path = alt
-    log.info(f"Excel saved → {path}")
     return path
+
+
+def _excel_part_path(base_path: str, part_no: int, part_total: int) -> str:
+    if part_total <= 1:
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    return f"{root}_part{part_no:03d}of{part_total:03d}{ext}"
+
+
+def _workbook_size_bytes(
+    df_pairs: pd.DataFrame,
+    df_summary: pd.DataFrame,
+    df_stats: pd.DataFrame,
+    errors: list[dict] | None,
+    df_skip: pd.DataFrame | None,
+) -> int:
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        _write_excel_part(tmp, df_pairs, df_summary, df_stats, errors, df_skip, 1, 1)
+        return os.path.getsize(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _max_pair_rows_for_limit(
+    df_pairs: pd.DataFrame,
+    df_stats: pd.DataFrame,
+    errors: list[dict] | None,
+    df_skip: pd.DataFrame | None,
+    max_bytes: int,
+) -> int:
+    """Largest number of pair rows that keep the workbook under max_bytes."""
+    n = len(df_pairs)
+    if n == 0:
+        return 0
+    lo, hi, best = 1, n, 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        chunk = df_pairs.iloc[:mid]
+        summary = build_folder_summary(chunk) if not chunk.empty else pd.DataFrame()
+        size = _workbook_size_bytes(chunk, summary, df_stats, errors, df_skip)
+        if size <= max_bytes:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path) -> str:
+    """Write Excel output, splitting into multiple files each <= MAX_EXCEL_BYTES."""
+    df_skip_all = _skipped_frame(skipped)
+    full_size = _workbook_size_bytes(df_pairs, df_summary, df_stats, errors, df_skip_all)
+    if full_size <= MAX_EXCEL_BYTES:
+        saved = _write_excel_part(path, df_pairs, df_summary, df_stats, errors, df_skip_all, 1, 1)
+        log.info(f"Excel saved → {saved} ({full_size / (1024 * 1024):.2f} MB)")
+        return saved
+
+    # First part may include errors/skipped; later parts are pairs-only.
+    parts: list[tuple[pd.DataFrame, list[dict] | None, pd.DataFrame | None]] = []
+    remaining = df_pairs.reset_index(drop=True)
+    aux_errors, aux_skip = errors, df_skip_all
+
+    empty_pairs = df_pairs.iloc[0:0].copy()
+    while True:
+        has_aux = bool(aux_errors) or (aux_skip is not None and not aux_skip.empty)
+        if remaining.empty and not has_aux:
+            break
+
+        if remaining.empty:
+            # Only aux sheets left — write them even if over the limit.
+            parts.append((empty_pairs, aux_errors, aux_skip))
+            break
+
+        fit = _max_pair_rows_for_limit(
+            remaining, df_stats, aux_errors, aux_skip, MAX_EXCEL_BYTES
+        )
+        if fit < 1 and has_aux:
+            # Aux sheets alone push over the limit: write them separately, then pairs.
+            parts.append((empty_pairs, aux_errors, aux_skip))
+            aux_errors, aux_skip = None, None
+            continue
+
+        if fit < 1:
+            fit = 1
+            log.warning(
+                "A single Excel chunk still exceeds %s MB; writing oversized part",
+                MAX_EXCEL_BYTES // (1024 * 1024),
+            )
+
+        chunk = remaining.iloc[:fit].copy()
+        parts.append((chunk, aux_errors, aux_skip))
+        remaining = remaining.iloc[fit:].reset_index(drop=True)
+        aux_errors, aux_skip = None, None
+
+    total = len(parts)
+    saved_paths: list[str] = []
+    for i, (chunk, err_part, skip_part) in enumerate(parts, start=1):
+        summary = build_folder_summary(chunk) if not chunk.empty else pd.DataFrame()
+        part_path = _excel_part_path(path, i, total)
+        saved = _write_excel_part(
+            part_path, chunk, summary, df_stats, err_part, skip_part, i, total
+        )
+        size = os.path.getsize(saved)
+        log.info(
+            f"Excel part {i}/{total} saved → {saved} ({size / (1024 * 1024):.2f} MB)"
+        )
+        saved_paths.append(saved)
+
+    return " | ".join(saved_paths)
 
 
 def records_from_claims(claims: list[dict], image_root: str | None = None) -> list[ImageRecord]:
@@ -666,6 +833,8 @@ def records_from_claims(claims: list[dict], image_root: str | None = None) -> li
                 rel = _norm_rel(rel)
                 if not rel or rel in seen:
                     continue
+                if os.path.splitext(rel)[1].lower() not in IMAGE_EXTS:
+                    continue
                 seen.add(rel)
                 records.append(ImageRecord(
                     folder_id    = extract_folder_id(rel),
@@ -680,12 +849,104 @@ def records_from_claims(claims: list[dict], image_root: str | None = None) -> li
     return records
 
 
-def publish_results(ok: list[dict], err: list[dict], skipped: list[dict], json_path: str) -> None:
-    claim_index = load_claim_index(json_path)
+def records_from_claims_minio(claims: list[dict]) -> list[ImageRecord]:
+    """Build image records keyed by MinIO object path (no local files)."""
+    records = []
+    seen: set[str] = set()
+    for entry in claims:
+        attachments_data = entry.get("attachments")
+        if not isinstance(attachments_data, dict):
+            continue
+        for group, files in attachments_data.items():
+            if not isinstance(files, list):
+                continue
+            for item in files:
+                if not isinstance(item, dict):
+                    continue
+                rel = _norm_rel(str(item.get("path") or ""))
+                if not rel or rel in seen:
+                    continue
+                if os.path.splitext(rel)[1].lower() not in IMAGE_EXTS:
+                    continue
+                seen.add(rel)
+                records.append(ImageRecord(
+                    folder_id    = extract_folder_id(rel),
+                    claimid      = str(entry.get("claimid", "")),
+                    attach_group = str(group),
+                    filename     = item.get("name") or os.path.basename(rel),
+                    rel_path     = rel,
+                    full_path    = rel,
+                    file_size    = int(item.get("size") or 0),
+                ))
+    records.sort(key=lambda r: r.rel_path)
+    return records
+
+
+def process_one_bytes(rec: dict, data: bytes) -> dict:
+    if not data:
+        rec["error"] = "empty_object"
+        return rec
+    if not rec.get("file_size"):
+        rec["file_size"] = len(data)
+
+    skip = is_blank_image_bytes(data, rec.get("file_size", 0))
+    if skip:
+        rec["skipped"] = skip
+        return rec
+
+    skip = is_xray_image_bytes(data)
+    if skip:
+        rec["skipped"] = skip
+        return rec
+
+    try:
+        rec["file_sha256"] = _file_sha256_bytes(data)
+        rec["pixel_sha256"], rec["img_size"] = _pixel_sha256_bytes(data)
+    except Exception as e:
+        rec["error"] = str(e)
+    return rec
+
+
+def hash_all_from_fetcher(
+    records: list[dict],
+    fetch_bytes: Callable[[str], bytes],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    ok, err, skipped = [], [], []
+    for r in tqdm(records, desc="MinIO hashing", unit="img"):
+        key = _norm_rel(r.get("rel_path") or "")
+        try:
+            data = fetch_bytes(key)
+        except Exception as e:
+            r["error"] = f"minio_fetch_failed: {e}"
+            err.append(r)
+            continue
+        res = process_one_bytes(r, data)
+        if res.get("error"):
+            err.append(res)
+        elif res.get("skipped"):
+            skipped.append(res)
+        else:
+            ok.append(res)
+    return ok, err, skipped
+
+
+def publish_results(
+    ok: list[dict],
+    err: list[dict],
+    skipped: list[dict],
+    json_path: str | None = None,
+    claims: list[dict] | None = None,
+) -> None:
+    if claims is not None:
+        claim_index = claim_index_from_claims(claims)
+    elif json_path:
+        claim_index = load_claim_index(json_path)
+    else:
+        claim_index = {}
     matched = attach_claim_details(ok, claim_index)
     matched += attach_claim_details(err, claim_index)
     matched += attach_claim_details(skipped, claim_index)
-    log.info(f"JSON details found for {matched:,} images")
+    log.info(f"Claim details found for {matched:,} images")
 
     n_blank = sum(1 for r in skipped if "blank_image" in str(r.get("skipped", "")))
     n_xray  = sum(1 for r in skipped if "xray_image" in str(r.get("skipped", "")))
@@ -755,7 +1016,25 @@ def detect_from_json(json_path: str, image_root: str | None = None) -> None:
     err = list(cache["err"]) if cache else []
     skipped = list(cache["skipped"]) if cache else []
     ok, err, skipped = append_new_images([asdict(rec) for rec in records], ok, err, skipped)
-    publish_results(ok, err, skipped, json_path)
+    publish_results(ok, err, skipped, json_path=json_path, claims=claims)
+
+
+def detect_from_claims(
+    claims: list[dict],
+    image_root: str,
+) -> None:
+    """Detect duplicates from in-memory claims using images already saved under image_root."""
+    records = records_from_claims(claims, image_root)
+    if not records:
+        log.info("No images in claims to process.")
+        return
+
+    cache = load_cache(CACHE_FILE)
+    ok = list(cache["ok"]) if cache else []
+    err = list(cache["err"]) if cache else []
+    skipped = list(cache["skipped"]) if cache else []
+    ok, err, skipped = append_new_images([asdict(rec) for rec in records], ok, err, skipped)
+    publish_results(ok, err, skipped, claims=claims)
 
 
 def _fingerprint_dicts(records: list[dict]) -> str:
@@ -779,7 +1058,7 @@ def main():
     err = list(cache["err"]) if cache else []
     skipped = list(cache["skipped"]) if cache else []
     ok, err, skipped = append_new_images(records_dicts, ok, err, skipped)
-    publish_results(ok, err, skipped, JSON_PATH)
+    publish_results(ok, err, skipped, json_path=JSON_PATH)
 
 
 if __name__ == "__main__":
