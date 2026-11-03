@@ -28,6 +28,28 @@ MINIO_SECRET_KEY=Flrr462el7E5cQFwo81HeA6x55zslRJnzboq7k2x
 MINIO_BUCKET=policy-management
 ```
 
+FTP upload (after Excel is created; panel backend can import from here):
+
+```
+FTP_ENABLED=true
+FTP_HOST=your.ftp.host
+FTP_PORT=21
+FTP_USER=...
+FTP_PASSWORD=...
+FTP_DIR=/suspicious-duplicates
+FTP_USE_TLS=false
+```
+
+Files are uploaded atomically (`*.uploading` then renamed). Set `FTP_ENABLED=false` or leave `FTP_HOST` empty to skip upload.
+
+Local Excel copies are kept for now (`EXCEL_KEEP_LOCAL=true`). When you only want FTP, set:
+
+```
+EXCEL_KEEP_LOCAL=false
+```
+
+That deletes local Excel files after a successful FTP upload.
+
 ```powershell
 .\.venv\Scripts\python.exe job.py
 ```

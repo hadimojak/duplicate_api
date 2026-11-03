@@ -10,6 +10,7 @@ from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
+from ftplib import FTP, FTP_TLS, error_perm
 from io import BytesIO
 from typing import Callable
 
@@ -636,53 +637,13 @@ def excel_output_path() -> str:
     return os.path.join(EXCEL_DIR, f"exact_duplicate_pairs_{stamp}.xlsx")
 
 
-def _skipped_frame(skipped: list[dict]) -> pd.DataFrame:
-    if not skipped:
-        return pd.DataFrame()
-    df_skip = pd.DataFrame(skipped)[[
-        "folder_id", "claimid", "filename",
-        "rel_path", "file_size", "skipped"
-    ]].copy()
-    df_skip["skip_type"] = df_skip["skipped"].apply(
-        lambda s: "xray" if "xray_image" in str(s) else "blank"
-    )
-    return df_skip
-
-
-def _write_excel_part(
-    path: str,
-    df_pairs: pd.DataFrame,
-    df_summary: pd.DataFrame,
-    df_stats: pd.DataFrame,
-    errors: list[dict] | None,
-    df_skip: pd.DataFrame | None,
-    part_no: int,
-    part_total: int,
-) -> str:
-    stats = df_stats.copy()
-    if part_total > 1:
-        stats = pd.concat([
-            stats,
-            pd.DataFrame([
-                {"metric": "Excel part", "value": f"{part_no}/{part_total}"},
-            ]),
-        ], ignore_index=True)
+def _write_excel_part(path: str, df_pairs: pd.DataFrame) -> str:
+    """Write only the duplicate_pairs sheet."""
 
     def _write(p: str) -> None:
+        pairs = df_pairs[PAIR_COLS] if not df_pairs.empty else pd.DataFrame(columns=PAIR_COLS)
         with pd.ExcelWriter(p, engine="openpyxl") as w:
-            pairs = df_pairs[PAIR_COLS] if not df_pairs.empty else pd.DataFrame(columns=PAIR_COLS)
             pairs.to_excel(w, sheet_name="duplicate_pairs", index=False)
-            df_summary.to_excel(w, sheet_name="suspicious_folders", index=False)
-            very_high = pairs[pairs["risk_level"] == "VERY_HIGH"] if not pairs.empty else pairs
-            very_high.to_excel(w, sheet_name="VERY_HIGH_only", index=False)
-            stats.to_excel(w, sheet_name="statistics", index=False)
-            if errors:
-                pd.DataFrame(errors).to_excel(w, sheet_name="errors", index=False)
-            if df_skip is not None and not df_skip.empty:
-                df_skip.to_excel(w, sheet_name="skipped_images", index=False)
-                df_xray = df_skip[df_skip["skip_type"] == "xray"]
-                if not df_xray.empty:
-                    df_xray.to_excel(w, sheet_name="skipped_xray", index=False)
 
     try:
         _write(path)
@@ -701,19 +662,13 @@ def _excel_part_path(base_path: str, part_no: int, part_total: int) -> str:
     return f"{root}_part{part_no:03d}of{part_total:03d}{ext}"
 
 
-def _workbook_size_bytes(
-    df_pairs: pd.DataFrame,
-    df_summary: pd.DataFrame,
-    df_stats: pd.DataFrame,
-    errors: list[dict] | None,
-    df_skip: pd.DataFrame | None,
-) -> int:
+def _workbook_size_bytes(df_pairs: pd.DataFrame) -> int:
     import tempfile
 
     fd, tmp = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
     try:
-        _write_excel_part(tmp, df_pairs, df_summary, df_stats, errors, df_skip, 1, 1)
+        _write_excel_part(tmp, df_pairs)
         return os.path.getsize(tmp)
     finally:
         try:
@@ -722,23 +677,15 @@ def _workbook_size_bytes(
             pass
 
 
-def _max_pair_rows_for_limit(
-    df_pairs: pd.DataFrame,
-    df_stats: pd.DataFrame,
-    errors: list[dict] | None,
-    df_skip: pd.DataFrame | None,
-    max_bytes: int,
-) -> int:
+def _max_pair_rows_for_limit(df_pairs: pd.DataFrame, max_bytes: int) -> int:
     """Largest number of pair rows that keep the workbook under max_bytes."""
     n = len(df_pairs)
-    if n == 0:
+    if n <= 0:
         return 0
-    lo, hi, best = 1, n, 1
+    lo, hi, best = 1, n, 0
     while lo <= hi:
         mid = (lo + hi) // 2
-        chunk = df_pairs.iloc[:mid]
-        summary = build_folder_summary(chunk) if not chunk.empty else pd.DataFrame()
-        size = _workbook_size_bytes(chunk, summary, df_stats, errors, df_skip)
+        size = _workbook_size_bytes(df_pairs.iloc[:mid])
         if size <= max_bytes:
             best = mid
             lo = mid + 1
@@ -747,67 +694,149 @@ def _max_pair_rows_for_limit(
     return best
 
 
-def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path) -> str:
-    """Write Excel output, splitting into multiple files each <= MAX_EXCEL_BYTES."""
-    df_skip_all = _skipped_frame(skipped)
-    full_size = _workbook_size_bytes(df_pairs, df_summary, df_stats, errors, df_skip_all)
-    if full_size <= MAX_EXCEL_BYTES:
-        saved = _write_excel_part(path, df_pairs, df_summary, df_stats, errors, df_skip_all, 1, 1)
-        log.info(f"Excel saved → {saved} ({full_size / (1024 * 1024):.2f} MB)")
-        return saved
+def save_excel(df_pairs, df_summary, df_stats, errors, skipped, path) -> list[str]:
+    """Write only duplicate_pairs, splitting into files each <= MAX_EXCEL_BYTES."""
+    del df_summary, df_stats, errors, skipped  # kept in signature for call-site compatibility
 
-    # First part may include errors/skipped; later parts are pairs-only.
-    parts: list[tuple[pd.DataFrame, list[dict] | None, pd.DataFrame | None]] = []
     remaining = df_pairs.reset_index(drop=True)
-    aux_errors, aux_skip = errors, df_skip_all
+    full_size = _workbook_size_bytes(remaining)
+    if full_size <= MAX_EXCEL_BYTES:
+        saved = _write_excel_part(path, remaining)
+        log.info(f"Excel saved → {saved} ({full_size / (1024 * 1024):.2f} MB)")
+        return [saved]
 
-    empty_pairs = df_pairs.iloc[0:0].copy()
-    while True:
-        has_aux = bool(aux_errors) or (aux_skip is not None and not aux_skip.empty)
-        if remaining.empty and not has_aux:
-            break
-
-        if remaining.empty:
-            # Only aux sheets left — write them even if over the limit.
-            parts.append((empty_pairs, aux_errors, aux_skip))
-            break
-
-        fit = _max_pair_rows_for_limit(
-            remaining, df_stats, aux_errors, aux_skip, MAX_EXCEL_BYTES
-        )
-        if fit < 1 and has_aux:
-            # Aux sheets alone push over the limit: write them separately, then pairs.
-            parts.append((empty_pairs, aux_errors, aux_skip))
-            aux_errors, aux_skip = None, None
-            continue
-
+    chunks: list[pd.DataFrame] = []
+    while not remaining.empty:
+        fit = _max_pair_rows_for_limit(remaining, MAX_EXCEL_BYTES)
         if fit < 1:
             fit = 1
             log.warning(
-                "A single Excel chunk still exceeds %s MB; writing oversized part",
+                "A single pairs row still exceeds %s MB; writing oversized part",
                 MAX_EXCEL_BYTES // (1024 * 1024),
             )
-
-        chunk = remaining.iloc[:fit].copy()
-        parts.append((chunk, aux_errors, aux_skip))
+        chunks.append(remaining.iloc[:fit].copy())
         remaining = remaining.iloc[fit:].reset_index(drop=True)
-        aux_errors, aux_skip = None, None
 
-    total = len(parts)
+    total = len(chunks)
     saved_paths: list[str] = []
-    for i, (chunk, err_part, skip_part) in enumerate(parts, start=1):
-        summary = build_folder_summary(chunk) if not chunk.empty else pd.DataFrame()
+    for i, chunk in enumerate(chunks, start=1):
         part_path = _excel_part_path(path, i, total)
-        saved = _write_excel_part(
-            part_path, chunk, summary, df_stats, err_part, skip_part, i, total
-        )
+        saved = _write_excel_part(part_path, chunk)
         size = os.path.getsize(saved)
-        log.info(
-            f"Excel part {i}/{total} saved → {saved} ({size / (1024 * 1024):.2f} MB)"
-        )
+        mb = size / (1024 * 1024)
+        if size > MAX_EXCEL_BYTES:
+            log.warning(
+                "Excel part %s/%s is %.2f MB (over %s MB limit) → %s",
+                i, total, mb, MAX_EXCEL_BYTES // (1024 * 1024), saved,
+            )
+        else:
+            log.info(f"Excel part {i}/{total} saved → {saved} ({mb:.2f} MB)")
         saved_paths.append(saved)
 
-    return " | ".join(saved_paths)
+    return saved_paths
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ftp_mkdirs(ftp: FTP, remote_dir: str) -> None:
+    """Create remote_dir (and parents) if needed, then cwd into it."""
+    remote_dir = remote_dir.replace("\\", "/").strip("/")
+    if not remote_dir:
+        return
+    ftp.cwd("/")
+    for part in remote_dir.split("/"):
+        if not part:
+            continue
+        try:
+            ftp.cwd(part)
+        except error_perm:
+            ftp.mkd(part)
+            ftp.cwd(part)
+
+
+def upload_excel_to_ftp(local_paths: list[str]) -> list[str]:
+    """
+    Upload Excel files to FTP for the panel backend.
+    Configure with env:
+      FTP_HOST, FTP_PORT (21), FTP_USER, FTP_PASSWORD,
+      FTP_DIR (remote folder), FTP_USE_TLS (false), FTP_ENABLED (true)
+    Skips upload when FTP_HOST is empty or FTP_ENABLED=false.
+    """
+    if not local_paths:
+        return []
+    if not _env_bool("FTP_ENABLED", "true"):
+        log.info("FTP upload disabled (FTP_ENABLED=false)")
+        return []
+
+    host = os.getenv("FTP_HOST", "").strip()
+    if not host:
+        log.warning("FTP_HOST not set; Excel files were saved locally only")
+        return []
+
+    port = int(os.getenv("FTP_PORT", "21") or "21")
+    user = os.getenv("FTP_USER", "").strip()
+    password = os.getenv("FTP_PASSWORD", "")
+    remote_dir = os.getenv("FTP_DIR", "/").strip() or "/"
+    use_tls = _env_bool("FTP_USE_TLS", "false")
+
+    uploaded: list[str] = []
+    ftp: FTP | FTP_TLS
+    if use_tls:
+        ftp = FTP_TLS()
+    else:
+        ftp = FTP()
+
+    try:
+        log.info("Connecting to FTP %s:%s ...", host, port)
+        ftp.connect(host, port, timeout=60)
+        ftp.login(user, password)
+        if use_tls and isinstance(ftp, FTP_TLS):
+            ftp.prot_p()
+        try:
+            ftp.set_pasv(True)
+        except Exception:
+            pass
+        _ftp_mkdirs(ftp, remote_dir)
+
+        for local_path in local_paths:
+            name = os.path.basename(local_path)
+            # Upload as .uploading then rename so the panel does not read a partial file.
+            tmp_name = f"{name}.uploading"
+            with open(local_path, "rb") as f:
+                ftp.storbinary(f"STOR {tmp_name}", f)
+            try:
+                ftp.delete(name)
+            except error_perm:
+                pass
+            ftp.rename(tmp_name, name)
+            remote = f"{remote_dir.rstrip('/')}/{name}"
+            uploaded.append(remote)
+            log.info("Uploaded Excel to FTP → %s", remote)
+    except Exception:
+        log.exception("FTP upload failed")
+        raise
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    return uploaded
+
+
+def remove_local_excel_files(local_paths: list[str]) -> None:
+    """Delete local Excel files after a successful FTP upload (when enabled)."""
+    for path in local_paths:
+        try:
+            os.remove(path)
+            log.info("Removed local Excel after FTP upload → %s", path)
+        except OSError as exc:
+            log.warning("Could not remove local Excel %s: %s", path, exc)
 
 
 def records_from_claims(claims: list[dict], image_root: str | None = None) -> list[ImageRecord]:
@@ -975,7 +1004,12 @@ def publish_results(
         {"metric": "HIGH — exact_pixel",                  "value": int(hi)},
         {"metric": "Folders involved",                    "value": int(folders)},
     ])
-    saved = save_excel(df_pairs, df_summary, df_stats, err, skipped, excel_output_path())
+    saved_paths = save_excel(df_pairs, df_summary, df_stats, err, skipped, excel_output_path())
+    remote_paths = upload_excel_to_ftp(saved_paths)
+    # Keep local Excel for now. Later set EXCEL_KEEP_LOCAL=false to delete after FTP upload.
+    if remote_paths and not _env_bool("EXCEL_KEEP_LOCAL", "true"):
+        remove_local_excel_files(saved_paths)
+        saved_paths = []
 
     print("\n" + "=" * 60)
     print("  Duplicate image results")
@@ -989,7 +1023,10 @@ def publish_results(
     print(f"  VERY_HIGH (exact_file):                    {vh:>8,}")
     print(f"  HIGH      (exact_pixel):                   {hi:>8,}")
     print(f"  Folders involved:                          {folders:>8,}")
-    print(f"\n  Excel → {saved}")
+    if saved_paths:
+        print(f"\n  Excel → {' | '.join(saved_paths)}")
+    if remote_paths:
+        print(f"  FTP   → {' | '.join(remote_paths)}")
     print("=" * 60)
 
     if not df_summary.empty:
