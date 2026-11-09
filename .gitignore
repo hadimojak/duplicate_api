@@ -1,6 +1,7 @@
 /TD
 /all_claims.json
 /all_claims_new.json
+/job_state.json
 __pycache__/
 *.pkl
 /excel output/
